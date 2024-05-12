@@ -6,8 +6,22 @@
 
 #define TILE_DIM 16
 
-// Функция-ядро
-__global__ void mulKernel(int *A, int *B, int *C, int N) {
+// Функция-ядро без тайлинга
+__global__ void mulKernelGlobal(int *A, int *B, int *C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(row < N && col < N) {
+        int sum = 0;
+        for(int k = 0; k < N; ++k) {
+            sum += A[row * N + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}
+
+// Функция-ядро с tiling
+__global__ void mulKernelTiling(int *A, int *B, int *C, int N) {
     // Создание 2 тайлов для матрицы A и B в shared memory
     __shared__ int ATile[TILE_DIM][TILE_DIM];
     __shared__ int BTile[TILE_DIM][TILE_DIM];
@@ -94,70 +108,13 @@ void matrix_mul_cpu(int *a, int *b, int *c, int N) {
     }
 }
 
-// void verify_results(int* arr1, int* arr2, int* arr3, int size) {
-//     for(int i = 0; i < size; i++) {
-//         if(arr1[i] != arr2[i] || arr1[i] != arr3[i] || arr2[i] != arr3[i]) {
-//             printf("Arrays are NOT the same!\n");
-//             return;
-//         }
-//     }
-//     printf("Arrays are the same!\n");
-// }
-
-void print_all_matrix(int *hostA, int *hostB, int *hostC, int *hostCCPU, int *hostCCPUTiling, int N) {
-    // Вывод матрицы A
-    printf("Matrix A:\n");
-    for(int i = 0; i < N; i++) {
-        for(int j = 0; j < N; j++) {
-            printf("%d ", hostA[i * N + j]);
-        }
-        printf("\n");
-    }
-
-    // Вывод матрицы C
-    printf("Matrix B:\n");
-    for(int i = 0; i < N; i++) {
-        for(int j = 0; j < N; j++) {
-            printf("%d ", hostB[i * N + j]);
-        }
-        printf("\n");
-    }
-
-    // Вывод матрицы C
-    printf("Matrix C:\n");
-    for(int i = 0; i < N; i++) {
-        for(int j = 0; j < N; j++) {
-            printf("%d ", hostC[i * N + j]);
-        }
-        printf("\n");
-    }
-
-    // Вывод матрицы CCPU
-    printf("Matrix C_CPU:\n");
-    for(int i = 0; i < N; i++) {
-        for(int j = 0; j < N; j++) {
-            printf("%d ", hostCCPU[i * N + j]);
-        }
-        printf("\n");
-    }
-
-    // Вывод матрицы CCPUTILING
-    printf("Matrix C_CPUTILING:\n");
-    for(int i = 0; i < N; i++) {
-        for(int j = 0; j < N; j++) {
-            printf("%d ", hostCCPUTiling[i * N + j]);
-        }
-        printf("\n");
-    }
-}
-
 int main() {
-    int *hostA, *hostB, *hostC, *hostCCPUTiling, *hostCCPU;
+    int *hostA, *hostB, *hostCGPUTiling, *hostCGPU, *hostCCPUTiling, *hostCCPU;
     int *deviceA, *deviceB, *deviceC;
     int N;
 
     // Создание переменных-событий
-    float timerValueGPU, timerValueCPU, timerValueCPUTiling;
+    float timerValueGPU, timerValueGPUTiling, timerValueCPU, timerValueCPUTiling;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -170,8 +127,9 @@ int main() {
     // Выделение памяти на хосте
     hostA = (int *)malloc(N * N * sizeof(int));
     hostB = (int *)malloc(N * N * sizeof(int));
-    hostC = (int *)malloc(N * N * sizeof(int));
+    hostCGPU = (int *)malloc(N * N * sizeof(int));
     hostCCPU = (int *)malloc(N * N * sizeof(int));
+    hostCGPUTiling = (int *)malloc(N * N * sizeof(int));
     hostCCPUTiling = (int *)malloc(N * N * sizeof(int));
 
     // Выделение памяти на устройстве (GPU)
@@ -196,6 +154,9 @@ int main() {
         }
     }
 
+    // Вывод времени
+    printf("\nTIME:");
+
     // ------------------------ GPU-tiling-вариант ------------------------
     // Запуск таймера
     cudaEventRecord(start, 0);
@@ -205,19 +166,42 @@ int main() {
     cudaMemcpy(deviceB, hostB, N * N * sizeof(int), cudaMemcpyHostToDevice);
 
     // Запуск ядра
-    mulKernel<<<DimGrid,DimBlock>>>(deviceA, deviceB, deviceC, N);
+    mulKernelTiling<<<DimGrid,DimBlock>>>(deviceA, deviceB, deviceC, N);
     cudaDeviceSynchronize();
 
     // Копирование результата обратно на хост
-    cudaMemcpy(hostC, deviceC, N * N * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hostCGPUTiling, deviceC, N * N * sizeof(int), cudaMemcpyDeviceToHost);
 
     // Оценка времени вычисления GPU-варианта
     cudaThreadSynchronize();
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&timerValueGPU, start, stop);
-    printf("\n GPU tiling calculation time %f msec\n", timerValueGPU);
+    cudaEventElapsedTime(&timerValueGPUTiling, start, stop);
+    printf("\n GPU-tiling    %f msec    ", timerValueGPUTiling);
     // --------------------------------------------------------------------
+
+    // ------------------------ GPU-no-tiling-вариант ------------------------
+    // Запуск таймера
+    cudaEventRecord(start, 0);
+
+    // Копирование данных на GPU
+    cudaMemcpy(deviceA, hostA, N * N * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceB, hostB, N * N * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Запуск ядра
+    mulKernelGlobal<<<DimGrid, DimBlock>>>(deviceA, deviceB, deviceC, N);
+    cudaDeviceSynchronize();
+
+    // Копирование результата обратно на хост
+    cudaMemcpy(hostCGPU, deviceC, N * N * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Оценка времени вычисления GPU-варианта без tiling
+    cudaThreadSynchronize();
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&timerValueGPU, start, stop);
+    printf("\n GPU-No-Tiling %f msec ", timerValueGPU);
+    // -----------------------------------------------------------------------
 
     // Освобождение памяти на устройстве
     cudaFree(deviceA);
@@ -236,7 +220,7 @@ int main() {
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&timerValueCPUTiling, start, stop);
-    printf("\n CPU tiling calculation time %f msec\n", timerValueCPUTiling);
+    printf("\n CPU-tiling    %f msec    ", timerValueCPUTiling);
     // -----------------------------------------------------------------------
 
     // ------------------------ CPU_no_tiling-вариант ------------------------
@@ -251,24 +235,25 @@ int main() {
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&timerValueCPU, start, stop);
-    printf("\n CPU calculation time %f msec\n", timerValueCPU);
+    printf("\n CPU-No-Tiling %f msec \n", timerValueCPU);
     // -----------------------------------------------------------------------
     
     // Вывод ускорения
-    printf("\n Acceleration between NoTilingCPU and TilingGPU %fx\n", timerValueCPU / timerValueGPU);
-    printf("\n Acceleration between TilingCPU and TilingGPU %fx\n", timerValueCPUTiling / timerValueGPU);
-    printf("\n Acceleration between NoTilingCPU and TilingCPU %fx\n", timerValueCPU / timerValueCPUTiling);
-
-    // Проверка решения
-    // verify_results(hostC, hostCCPU, hostCCPUTiling, N);
-
-    // Вывод всех матриц
-    // print_all_matrix(hostA, hostB, hostC, hostCCPU, hostCCPUTiling, N);
+    printf("\nACCELERATION:");
+    printf("\n NoTilingCPU / TilingGPU   %fx", timerValueCPU / timerValueGPUTiling);
+    printf("\n NoTilingCPU / NoTilingGPU %fx", timerValueCPU / timerValueGPU);
+    printf("\n NoTilingCPU / TilingCPU   %fx", timerValueCPU / timerValueCPUTiling);
+    printf("\n TilingCPU   / TilingGPU   %fx", timerValueCPUTiling / timerValueGPUTiling);
+    printf("\n TilingCPU   / NoTilingGPU %fx", timerValueCPUTiling / timerValueGPU);
+    printf("\n NoTilingGPU / TilingGPU   %fx", timerValueGPU / timerValueGPUTiling);
 
     // Освобождение памяти на хосте
     free(hostA);
     free(hostB);
-    free(hostC);
+    free(hostCCPU);
+    free(hostCGPU);
+    free(hostCCPUTiling);
+    free(hostCGPUTiling);
 
     return 0;
 }
