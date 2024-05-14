@@ -4,10 +4,9 @@
 #include <iomanip>
 #include <omp.h>
 
-#define DIM 16
-
 using namespace std;
 
+#define TILE_DIM 16
 
 // --------------------------------- NORM-CALCULATION ---------------------------------
 void multiplyMatrixVector(double* A, double* x, double* result, int N) {
@@ -134,7 +133,7 @@ void CPU_Parallel_Jacobi_Method(double* A, double* f, double* x, int N, double e
 
     delete[] x_prev; // освобождаем память
     delete[] Ax; // освобождаем память
-    cout << "Iteration count: " << iterations;
+    cout << "\nIteration count: " << iterations;
 }
 // -----------------------------------------------------------------------------------
 
@@ -155,8 +154,8 @@ __global__ void jacobi_no_tiling_Kernel(double* x_next, const double* A, const d
 
 void GPU_NO_TILING_Jacobi_Method(double* A, double* f, double* x, int N, double eps) {
     // Размеры блока и сетки
-    dim3 DimGrid((N + DIM - 1) / DIM, (N + DIM - 1) / DIM, 1);
-    dim3 DimBlock(DIM, DIM, 1);
+    int threads_per_block = 16;
+    int blocks_per_grid = (N + threads_per_block - 1) / threads_per_block;
 
     // Выделяем память на устройстве
     double* d_A;
@@ -182,7 +181,7 @@ void GPU_NO_TILING_Jacobi_Method(double* A, double* f, double* x, int N, double 
         cudaMemcpy(x_prev, d_x_now, N * sizeof(double), cudaMemcpyDeviceToHost);
 
         // Запускаем ядро Якоби
-        jacobi_no_tiling_Kernel<<<DimGrid, DimBlock>>>(d_x_next, d_A, d_x_now, d_f, N);
+        jacobi_no_tiling_Kernel<<<threads_per_block, blocks_per_grid>>>(d_x_next, d_A, d_x_now, d_f, N);
 
         // Копируем результат Device->Host для проверки условия остановки
         cudaMemcpy(x, d_x_next, N * sizeof(double), cudaMemcpyDeviceToHost);
@@ -202,7 +201,7 @@ void GPU_NO_TILING_Jacobi_Method(double* A, double* f, double* x, int N, double 
     }
 
     // Вывод числа итераций
-    cout << "Iteration count: " << iteration;
+    cout << "\nIteration count: " << iteration;
 
     // Освобождаем память
     cudaFree(d_A);
@@ -213,6 +212,135 @@ void GPU_NO_TILING_Jacobi_Method(double* A, double* f, double* x, int N, double 
     delete[] Ax;
 }
 // -----------------------------------------------------------------------------------
+
+// ------------------------------------- GPU-Tiling -------------------------------------
+__global__ void jacobiTilingKernel(double* x_next, const double* A, const double* x_now, const double* b, int N) {
+    __shared__ double x_tile[TILE_DIM];
+
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+    int i = bx * blockDim.x + tx;
+
+    if(i < N) {
+        double sigma = 0.0;
+        for(int j = 0; j < N; j += TILE_DIM) {
+            if(j + tx < N) {
+                x_tile[tx] = x_now[j + tx];
+            }
+            __syncthreads();
+
+            for(int k = 0; k < TILE_DIM && (j + k) < N; ++k) {
+                if(i != (j + k)) {
+                    sigma += A[i * N + (j + k)] * x_tile[k];
+                }
+            }
+            __syncthreads();
+        }
+        x_next[i] = (b[i] - sigma) / A[i * N + i];
+    }
+}
+
+__global__ void multiplyMatrixVectorKernel(const double* A, const double* x, double* result, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(i < N) {
+        double sum = 0.0;
+        for(int j = 0; j < N; ++j) {
+            sum += A[i * N + j] * x[j];
+        }
+        result[i] = sum;
+    }
+}
+
+__global__ void computeNormKernel(const double* Ax, const double* b, double* norm, int N) {
+    __shared__ double partialSum[TILE_DIM];
+
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+    int i = bx * blockDim.x + tx;
+
+    double diff = 0.0;
+    if(i < N) {
+        diff = Ax[i] - b[i];
+        partialSum[tx] = diff * diff;
+    } else {
+        partialSum[tx] = 0.0;
+    }
+    __syncthreads();
+
+    for(int i = blockDim.x / 2; i > 0; i /= 2) {
+        if(tx < i) {
+            partialSum[tx] += partialSum[tx + i];
+        }
+        __syncthreads();
+    }
+
+    if(tx == 0) {
+        norm[blockIdx.x] = partialSum[0];
+    }
+}
+
+void GPU_TILING_Jacobi_Method(double* A, double* b, double* x, int N, double eps) {
+    int threads_per_block = TILE_DIM;
+    int blocks_per_grid = (N + threads_per_block - 1) / threads_per_block;
+
+    double* d_A;
+    double* d_x_now;
+    double* d_x_next;
+    double* d_b;
+    double* d_Ax;
+    double* d_partial_norm;
+    cudaMalloc(&d_A, N * N * sizeof(double));
+    cudaMalloc(&d_x_now, N * sizeof(double));
+    cudaMalloc(&d_x_next, N * sizeof(double));
+    cudaMalloc(&d_b, N * sizeof(double));
+    cudaMalloc(&d_Ax, N * sizeof(double));
+    cudaMalloc(&d_partial_norm, blocks_per_grid * sizeof(double));
+
+    cudaMemcpy(d_A, A, N * N * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_x_now, x, N * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, b, N * sizeof(double), cudaMemcpyHostToDevice);
+
+    double* x_prev = new double[N];
+    double* partial_norm = new double[blocks_per_grid];
+    int iteration = 0;
+
+    while(true) {
+        cudaMemcpy(x_prev, d_x_now, N * sizeof(double), cudaMemcpyDeviceToHost);
+        jacobiTilingKernel<<<blocks_per_grid, threads_per_block>>>(d_x_next, d_A, d_x_now, d_b, N);
+        cudaMemcpy(x, d_x_next, N * sizeof(double), cudaMemcpyDeviceToHost);
+
+        multiplyMatrixVectorKernel<<<blocks_per_grid, threads_per_block>>>(d_A, d_x_next, d_Ax, N);
+        computeNormKernel<<<blocks_per_grid, threads_per_block>>>(d_Ax, d_b, d_partial_norm, N);
+
+        cudaMemcpy(partial_norm, d_partial_norm, blocks_per_grid * sizeof(double), cudaMemcpyDeviceToHost);
+        double norm = 0.0;
+        for(int i = 0; i < blocks_per_grid; ++i) {
+            norm += partial_norm[i];
+        }
+        norm = sqrt(norm);
+
+        iteration++;
+
+        if(norm <= eps) {
+            break;
+        }
+
+        cudaMemcpy(d_x_now, d_x_next, N * sizeof(double), cudaMemcpyHostToDevice);
+    }
+
+    cout << "Iteration count: " << iteration;
+
+    cudaFree(d_A);
+    cudaFree(d_x_now);
+    cudaFree(d_x_next);
+    cudaFree(d_b);
+    cudaFree(d_Ax);
+    cudaFree(d_partial_norm);
+    delete[] x_prev;
+    delete[] partial_norm;
+}
+// --------------------------------------------------------------------------------------
 
 // ------------------------------------- GENERATION -------------------------------------
 // Генерация матрицы с диагональным доминированием
@@ -271,7 +399,7 @@ void printVector(double* v, int N, int precision) {
 int main() {
     srand(time(NULL)); // инициализация генератора случайных чисел
  
-    int N = 256; // размер матрицы и вектора
+    int N = 128; // размер матрицы и вектора
     double eps = 1e-5; // погрешность
     int precision = 10; // количество знаков после запятой в выводе
 
@@ -280,6 +408,10 @@ int main() {
     double* x_cpu = new double[N](); // начальное приближение CPU_NO_TILING (нулевой вектор)
     double* x_cpu_omp = new double[N](); // начальное приближение CPU_OMP (нулевой вектор)
     double* x_gpu = new double[N](); // начальное приближение GPU_NO_TILING (нулевой вектор)
+    double* x_gpu_tiling_1 = new double[N](); // начальное приближение GPU_NO_TILING (нулевой вектор)
+    double* x_gpu_tiling_2 = new double[N](); // начальное приближение GPU_NO_TILING (нулевой вектор)
+    double* x_gpu_tiling_3 = new double[N](); // начальное приближение GPU_NO_TILING (нулевой вектор)
+    double* x_gpu_tiling_4 = new double[N](); // начальное приближение GPU_NO_TILING (нулевой вектор)
 
     // События для измерения времени
     cudaEvent_t start, stop;
@@ -289,12 +421,6 @@ int main() {
     // Генерация матрицы и вектора
     generateMatrix(A, N);
     generateVector(f, N);
-
-    // cout << "Матрица A:" << endl;
-    // printMatrix(A, N, precision);
-
-    // cout << "Вектор f:" << endl;
-    // printVector(f, N, precision);
 
     // Вывод времени
     printf("\nTIME:");
@@ -308,10 +434,6 @@ int main() {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&timerValueCPU, start, stop);
     printf("\n СPU         %f msec", timerValueCPU);
-
-    // Вывод результата
-    // cout << "Решение x_cpu:" << endl;
-    // printVector(x_cpu, N, precision);
     // ---------------------------------------------------------------------    
 
     // -------------------------------- CPU-OMP --------------------------------
@@ -323,10 +445,6 @@ int main() {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&timerValueCPUOpenMP, start, stop);
     printf("\n СPU(OpenMP) %f msec", timerValueCPUOpenMP);
-
-    // Вывод результата
-    // cout << "Решение x_cpu_omp:" << endl;
-    // printVector(x_cpu_omp, N, precision);
     // -------------------------------------------------------------------------
 
     // -------------------------------- GPU --------------------------------
@@ -338,17 +456,18 @@ int main() {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&timerValueGPU, start, stop);
     printf("\n GPU         %f msec", timerValueGPU);
-
-    // Вывод результата
-    // cout << "Решение x_gpu:" << endl;
-    // printVector(x_gpu, N, precision);
     // ---------------------------------------------------------------------
 
-    // Вывод ускорения
-    printf("\nACCELERATION:");
-    printf("\n CPU / CPU(OpenMP)  %fx", timerValueCPU / timerValueCPUOpenMP);
-    printf("\n CPU / GPU          %fx", timerValueCPU / timerValueGPU);
-    printf("\n CPU(OpenMP) / GPU  %fx", timerValueCPUOpenMP / timerValueGPU);
+    // -------------------------------- GPU-Tiling --------------------------------
+    cudaEventRecord(start, 0); // старт таймера
+    GPU_TILING_Jacobi_Method(A, f, x_gpu_tiling_1, N, eps); // вызов метода Якоби
+
+    float timerValueGPUTiling;
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&timerValueGPUTiling, start, stop);
+    printf("\n GPU(Tiling) %f msec", timerValueGPUTiling);
+    // ----------------------------------------------------------------------------
 
     // Освобождение памяти
     delete[] A;
@@ -356,6 +475,10 @@ int main() {
     delete[] x_cpu;
     delete[] x_cpu_omp;
     delete[] x_gpu;
+    delete[] x_gpu_tiling_1;
+    delete[] x_gpu_tiling_2;
+    delete[] x_gpu_tiling_3;
+    delete[] x_gpu_tiling_4;
 
     return 0;
 }
